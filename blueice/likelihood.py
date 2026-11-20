@@ -18,7 +18,7 @@ from .parallel import create_models_ipyparallel, compute_many
 from .utils import combine_dicts, inherit_docstring_from
 from . import inference
 
-from .pdf_morphers import GridInterpolator, RadialInterpolator
+from .pdf_morphers import GridInterpolator, MultilinearGridInterpolator, RadialInterpolator
 from .pdf_morphers_cubic import CubicSplineInterpolator
 MORPHERS = {x.__name__: x for x in [GridInterpolator, RadialInterpolator, CubicSplineInterpolator]}
 
@@ -690,6 +690,119 @@ class BinnedLogLikelihood(LogLikelihoodBase):
                 - self._log_factorial_counts_sum)
 
 
+    def supports_gradient(self):
+        """Whether loglikelihood_and_gradient can be used for this likelihood."""
+        if self.model_statistical_uncertainty_handling is not None or self._has_non_numeric:
+            return False
+        if any(lp is not None for lp in self.rate_parameters.values()):
+            return False
+        if any(lp is not None for _, lp, _ in self.shape_parameters.values()):
+            return False
+        if any(self.source_allowed_negative):
+            return False
+        if len(self.shape_parameters):
+            return (isinstance(self.ps_interpolator, MultilinearGridInterpolator)
+                    and isinstance(self.mus_interpolator, MultilinearGridInterpolator))
+        return True
+
+    @_needs_data
+    def loglikelihood_and_gradient(self, livetime_days=None, **kwargs):
+        """Return the log likelihood (same value as __call__) and its gradient.
+
+        The gradient is a dict with an entry for every rate multiplier
+        (<source>_rate_multiplier) and every shape parameter of this likelihood. For shape
+        parameters it is the derivative of the multilinear interpolation (one-sided at anchors).
+        Only for the configurations accepted by supports_gradient().
+        """
+        if not self.supports_gradient():
+            raise NotImplementedError("Gradient not available for this likelihood configuration")
+        rate_multipliers, shape_parameter_settings = self._kwargs_to_settings(**kwargs)
+        rate_multipliers = np.asarray(rate_multipliers, dtype=float)
+        n_sources = len(self.source_name_list)
+        shape_names = list(self.shape_parameters.keys())
+        zero_gradient = {sn + '_rate_multiplier': 0. for sn in self.source_name_list}
+        zero_gradient.update({sn: 0. for sn in shape_names})
+
+        # Interpolate rates and pmfs (as __call__), keeping the corner weights for the gradient
+        if len(shape_names):
+            zs = []
+            for setting_name in shape_names:
+                z = shape_parameter_settings[setting_name]
+                minbound, maxbound = self.get_bounds(setting_name)
+                if not minbound <= z <= maxbound:
+                    return -float('inf'), zero_gradient
+                zs.append(z)
+            rows, weights, weight_gradients = self.ps_interpolator.corner_weights(np.asarray(zs))
+            ps = self.ps_interpolator.combine(rows, weights).reshape(self.ps.shape)
+            mus_anchor = self.mus_interpolator.values[rows]  # (n_corners, n_sources)
+            mus = weights @ mus_anchor
+        else:
+            ps = self.ps
+            mus = np.asarray(self.base_model.expected_events(), dtype=float).copy()
+
+        # Everything multiplying the interpolated rate of each source: M_s = mus_s * factor_s
+        livetime_scale = 1.
+        if livetime_days is not None:
+            if 'livetime_days' not in self.pdf_base_config:
+                raise ValueError("Cannot scale live-time, base value absent")
+            if self.pdf_base_config['livetime_days'] == 0:
+                raise NotImplementedError("Gradient not available for zero base livetime")
+            livetime_scale = livetime_days / self.pdf_base_config['livetime_days']
+        factor = rate_multipliers * livetime_scale
+        efficiencies = np.ones(n_sources)
+        if True in self.source_apply_efficiency:
+            for source_i, (sae, sen) in enumerate(zip(self.source_apply_efficiency,
+                                                      self.source_efficiency_names)):
+                if sae:
+                    efficiencies[source_i] = shape_parameter_settings.get(sen, 1)
+        expected = mus * factor * efficiencies  # M_s, as mus in __call__
+
+        if not np.all((expected >= 0) & (expected < float('inf'))):
+            if self.config.get('unphysical_behaviour') == 'error':
+                raise ValueError("Unphysical rates: %s" % str(expected))
+            return -float('inf'), zero_gradient
+
+        ll = self._compute_likelihood(expected, ps)
+        if not np.isfinite(ll):
+            # e.g. data in a bin without expected events; no meaningful gradient
+            return ll, zero_gradient
+
+        # d ll / d lambda_b = n_b / lambda_b - 1 (and -1 for empty bins with lambda_b = 0)
+        observed_counts = self.data_events_per_bin.histogram
+        expected_total = np.einsum('s,s...->...', expected, ps)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dll_dlambda = np.where(observed_counts > 0, observed_counts / expected_total, 0.) - 1.
+        # A_s = sum_b dll/dlambda_b * p_sb
+        a_s = np.einsum('sb,b->s', ps.reshape(n_sources, -1), dll_dlambda.ravel())
+
+        gradient = {}
+        # rate multipliers: d M_s / d r_s = mus_s * livetime_scale * eff_s
+        for source_i, source_name in enumerate(self.source_name_list):
+            gradient[source_name + '_rate_multiplier'] = \
+                a_s[source_i] * mus[source_i] * livetime_scale * efficiencies[source_i]
+
+        if len(shape_names):
+            # d lambda_b / d z_k = sum_c dw_ck [ sum_s mus_cs f_s e_s p_sb + sum_s M_s P_csb ]
+            pmf_size = ps[0].size
+            dll_dlambda_flat = dll_dlambda.ravel()
+            per_corner = np.empty(len(rows))
+            for c, row_i in enumerate(rows):
+                pmf_c = self.ps_interpolator.values[row_i].reshape(n_sources, pmf_size)
+                per_corner[c] = (np.dot(mus_anchor[c] * factor * efficiencies, a_s)
+                                 + np.dot(expected, np.einsum('sb,b->s', pmf_c, dll_dlambda_flat)))
+            shape_gradient = per_corner @ weight_gradients
+            for k, setting_name in enumerate(shape_names):
+                gradient[setting_name] = shape_gradient[k]
+
+        # efficiency parameters also scale the rates of the sources using them
+        if True in self.source_apply_efficiency:
+            for source_i, (sae, sen) in enumerate(zip(self.source_apply_efficiency,
+                                                      self.source_efficiency_names)):
+                if sae and sen in gradient:
+                    gradient[sen] += a_s[source_i] * mus[source_i] * factor[source_i]
+        return ll, gradient
+
+
 def extended_loglikelihood(mu, ps, outlier_likelihood=0.0):
     """Evaluate an extended unbinned likelihood function
     :param mu: array of n_sources: expected number of events
@@ -941,6 +1054,33 @@ class LogLikelihoodSum(object):
                                   livetime_days=livetime,
                                   **pass_kwargs)
         return ret
+
+    def supports_gradient(self):
+        """Whether every term provides loglikelihood_and_gradient."""
+        return all(hasattr(ll, 'loglikelihood_and_gradient')
+                   and getattr(ll, 'supports_gradient', lambda: True)()
+                   for ll in self.likelihood_list)
+
+    def loglikelihood_and_gradient(self, livetime_days=None, **kwargs):
+        """Return the weighted sum of the terms' log likelihoods and of their gradients (dict)."""
+        ret = 0.
+        gradient = {}
+        for i, (ll, parameter_names, ll_weight) in enumerate(
+                zip(self.likelihood_list,
+                    self.likelihood_parameters,
+                    self.likelihood_weights)):
+            pass_kwargs = {k: v
+                           for k, v in kwargs.items()
+                           if k in parameter_names}
+            livetime = livetime_days
+            if isinstance(livetime_days, list):
+                livetime = livetime_days[i]
+            value, term_gradient = ll.loglikelihood_and_gradient(livetime_days=livetime,
+                                                                 **pass_kwargs)
+            ret += ll_weight * value
+            for k, g in term_gradient.items():
+                gradient[k] = gradient.get(k, 0.) + ll_weight * g
+        return ret, gradient
 
     def split_results(self, result_dict):
         ret = []

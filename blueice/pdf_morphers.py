@@ -65,13 +65,27 @@ class MultilinearGridInterpolator(object):
         # all corners of the unit hypercube, shape (2**n_dims, n_dims)
         self.corners = np.array([[(i >> (self.n_dims - 1 - d)) & 1 for d in range(self.n_dims)]
                                  for i in range(2 ** self.n_dims)], dtype=int)
+        self.corner_offsets = self.corners @ self.strides
 
-    def __call__(self, z):
+    def corner_weights(self, z, gradient=True):
+        """Return the anchor rows, weights and weight derivatives used to interpolate at z.
+
+        The interpolated value is sum_c weights[c] * self.values[rows[c]], and its derivative
+        with respect to z_k is sum_c weight_gradients[c, k] * self.values[rows[c]] (the one-sided
+        derivative in the cell to the right of z at an interior anchor, to the left at the upper
+        edge of the grid). Corners whose weight and weight derivatives are all zero are omitted.
+
+        :param gradient: if False, skip the weight derivatives (returns None for them) and drop
+                         all zero-weight corners
+        :return: rows (int array, n_corners), weights (n_corners), weight_gradients
+                 (n_corners, n_dims)
+        """
         z = np.asarray(z, dtype=float).ravel()
         if len(z) != self.n_dims:
             raise ValueError("Expected a point with %d coordinates, got %s" % (self.n_dims, z))
         lower = np.zeros(self.n_dims, dtype=int)
         frac = np.zeros(self.n_dims)
+        inv_width = np.zeros(self.n_dims)
         for d, (g, x) in enumerate(zip(self.grid_arrays, z)):
             if not g[0] <= x <= g[-1]:
                 raise ValueError("Point %s is out of bounds in dimension %d" % (z, d))
@@ -79,17 +93,38 @@ class MultilinearGridInterpolator(object):
                 continue
             i = min(max(int(np.searchsorted(g, x, side='right')) - 1, 0), len(g) - 2)
             lower[d] = i
-            frac[d] = (x - g[i]) / (g[i + 1] - g[i])
+            inv_width[d] = 1. / (g[i + 1] - g[i])
+            frac[d] = (x - g[i]) * inv_width[d]
 
+        # per-dimension weights (frac or 1 - frac) and their derivatives for all corners at once
+        upper = self.corners == 1
+        w_d = np.where(upper, frac, 1. - frac)
+        dw_d = np.where(upper, inv_width, -inv_width)
+        weights = np.prod(w_d, axis=1)
+        if not gradient:
+            keep = weights != 0
+            return int(np.dot(lower, self.strides)) + self.corner_offsets[keep], weights[keep], None
+        weight_gradients = np.empty((len(self.corners), self.n_dims))
+        for k in range(self.n_dims):
+            others = w_d.copy()
+            others[:, k] = 1.
+            weight_gradients[:, k] = dw_d[:, k] * np.prod(others, axis=1)
+        # drop corners that contribute nothing (incl. those beyond single-anchor dimensions)
+        keep = (weights != 0) | np.any(weight_gradients != 0, axis=1)
+        rows = int(np.dot(lower, self.strides)) + self.corner_offsets[keep]
+        return rows, weights[keep], weight_gradients[keep]
+
+    def __call__(self, z):
+        rows, weights, _ = self.corner_weights(z, gradient=False)
+        return self.combine(rows, weights).reshape(self.output_shape)
+
+    def combine(self, rows, weights):
+        """sum_c weights[c] * self.values[rows[c]], skipping zero weights (flat array)."""
         result = None
-        base = int(np.dot(lower, self.strides))
-        for corner in self.corners:
-            w = 1.
-            for d in range(self.n_dims):
-                w *= frac[d] if corner[d] else 1. - frac[d]
+        for row_i, w in zip(rows, weights):
             if w == 0:
                 continue
-            row = self.values[base + int(np.dot(corner, self.strides))]
+            row = self.values[row_i]
             if result is None:
                 result = w * row  # fresh array: callers may modify the result in place
                 buffer = np.empty_like(result)
@@ -99,7 +134,10 @@ class MultilinearGridInterpolator(object):
                 # shipping their own OpenBLAS.
                 np.multiply(row, w, out=buffer)
                 np.add(result, buffer, out=result)
-        return result.reshape(self.output_shape)
+        if result is None:
+            # all weights zero cannot happen for points inside the grid; keep the shape anyway
+            result = np.zeros(self.values.shape[1])
+        return result
 
 
 class GridInterpolator(Morpher):
