@@ -1,7 +1,6 @@
 """Morphers: interpolate multidimensional functions of models
 """
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 from scipy.spatial import KDTree
 from tqdm import tqdm
 
@@ -38,6 +37,71 @@ class Morpher(object):
         raise NotImplementedError
 
 
+class MultilinearGridInterpolator(object):
+    """Multilinear interpolation of array-valued scores on a regular grid of anchor points.
+
+    Equivalent to ``RegularGridInterpolator(grid_arrays, anchor_scores)(z)[0]`` for a single point z
+    (method 'linear', bounds_error=True), but much faster for the typical blueice use: few shape
+    dimensions and a large output array (e.g. sources x bins). The anchor scores are stored as a
+    contiguous (n_anchor_points, n_outputs) array; a call finds the grid cell, computes the 2**n_dims
+    corner weights and accumulates the weighted corner rows, skipping corners with zero weight.
+    """
+
+    def __init__(self, grid_arrays, anchor_scores):
+        self.grid_arrays = [np.asarray(g, dtype=float) for g in grid_arrays]
+        self.n_dims = len(self.grid_arrays)
+        anchor_scores = np.asarray(anchor_scores, dtype=float)
+        grid_shape = anchor_scores.shape[:self.n_dims]
+        if tuple(len(g) for g in self.grid_arrays) != grid_shape:
+            raise ValueError("Shape of anchor_scores %s does not match the grid %s"
+                             % (anchor_scores.shape, [len(g) for g in self.grid_arrays]))
+        for g in self.grid_arrays:
+            if len(g) > 1 and not np.all(np.diff(g) > 0):
+                raise ValueError("Grid points must be strictly ascending")
+        self.output_shape = anchor_scores.shape[self.n_dims:]
+        self.values = np.ascontiguousarray(anchor_scores.reshape(int(np.prod(grid_shape)), -1))
+        # C-order strides (in rows of self.values) of the grid dimensions
+        self.strides = np.array([int(np.prod(grid_shape[d + 1:])) for d in range(self.n_dims)], dtype=int)
+        # all corners of the unit hypercube, shape (2**n_dims, n_dims)
+        self.corners = np.array([[(i >> (self.n_dims - 1 - d)) & 1 for d in range(self.n_dims)]
+                                 for i in range(2 ** self.n_dims)], dtype=int)
+
+    def __call__(self, z):
+        z = np.asarray(z, dtype=float).ravel()
+        if len(z) != self.n_dims:
+            raise ValueError("Expected a point with %d coordinates, got %s" % (self.n_dims, z))
+        lower = np.zeros(self.n_dims, dtype=int)
+        frac = np.zeros(self.n_dims)
+        for d, (g, x) in enumerate(zip(self.grid_arrays, z)):
+            if not g[0] <= x <= g[-1]:
+                raise ValueError("Point %s is out of bounds in dimension %d" % (z, d))
+            if len(g) == 1:
+                continue
+            i = min(max(int(np.searchsorted(g, x, side='right')) - 1, 0), len(g) - 2)
+            lower[d] = i
+            frac[d] = (x - g[i]) / (g[i + 1] - g[i])
+
+        result = None
+        base = int(np.dot(lower, self.strides))
+        for corner in self.corners:
+            w = 1.
+            for d in range(self.n_dims):
+                w *= frac[d] if corner[d] else 1. - frac[d]
+            if w == 0:
+                continue
+            row = self.values[base + int(np.dot(corner, self.strides))]
+            if result is None:
+                result = w * row  # fresh array: callers may modify the result in place
+                buffer = np.empty_like(result)
+            else:
+                # result += w * row without temporaries. Plain ufuncs rather than BLAS (daxpy): BLAS
+                # calls this small get multi-threaded and thrash, esp. with numpy and scipy each
+                # shipping their own OpenBLAS.
+                np.multiply(row, w, out=buffer)
+                np.add(result, buffer, out=result)
+        return result.reshape(self.output_shape)
+
+
 class GridInterpolator(Morpher):
 
     @inherit_docstring_from(Morpher)
@@ -63,10 +127,7 @@ class GridInterpolator(Morpher):
             anchor_scores[tuple(anchor_grid_index + [slice(None)] * len(extra_dims))] = \
                 f(anchor_models[tuple(_zs)])
 
-        itp = RegularGridInterpolator(self.anchor_z_arrays, anchor_scores)
-
-        # For some reason I'm getting an extra first dimension with everything in the first element, let's remove it...
-        return lambda *args: itp(*args)[0]
+        return MultilinearGridInterpolator(self.anchor_z_arrays, anchor_scores)
 
     def _anchor_grid_iterator(self):
         """Iterates over the anchor grid, yielding index, z-values"""

@@ -9,7 +9,7 @@ from functools import wraps
 
 import numpy as np
 from multihist import Histdd
-from scipy import stats
+from scipy import special, stats
 from tqdm import tqdm
 
 from .exceptions import NotPreparedException, InvalidParameterSpecification, InvalidParameter
@@ -621,6 +621,10 @@ class BinnedLogLikelihood(LogLikelihoodBase):
     @_needs_data
     @inherit_docstring_from(LogLikelihoodBase)
     def adjust_expectations(self, mus, pmfs, n_model_events):
+        if self.model_statistical_uncertainty_handling is None:
+            # Nothing to adjust; _compute_likelihood does not mutate its inputs, so no copies needed
+            return mus, pmfs
+
         # Avoid mutating the arrays we're also going to return
         mus = mus.copy()
         pmfs = pmfs.copy()
@@ -667,15 +671,23 @@ class BinnedLogLikelihood(LogLikelihoodBase):
         :param mus: numpy array with expected rates for each source
         :param pmfs: array (sources, *analysis_space) of PMFs for each source in each bin
         """
-        expected_counts = pmfs.copy()
-        for mu, _p_bin_source in zip(mus, expected_counts):
-            _p_bin_source *= mu         # Works because of numpy view magic...
-        expected_total = np.sum(expected_counts, axis=0)
-
+        # sum_s mu_s * pmf_s, without modifying the inputs. einsum (no BLAS) rather than tensordot:
+        # multi-threaded BLAS on arrays this small wastes all cores and can be much slower.
+        expected_total = np.einsum('s,s...->...', mus, pmfs)
         observed_counts = self.data_events_per_bin.histogram
 
-        ret = stats.poisson(expected_total).logpmf(observed_counts)
-        return np.sum(ret)
+        if np.any(expected_total < 0):
+            # scipy.stats.poisson.logpmf gives nan for negative expectations
+            return np.nan
+
+        # Poisson log pmf, k log(mu) - mu - log(k!), same conventions as scipy.stats.poisson.logpmf
+        # (xlogy gives 0 for k = mu = 0, -inf for k > 0 = mu). log(k!) only depends on the data.
+        if getattr(self, '_log_factorial_counts_of', None) is not observed_counts:
+            self._log_factorial_counts_sum = np.sum(special.gammaln(observed_counts + 1))
+            self._log_factorial_counts_of = observed_counts
+        return (np.sum(special.xlogy(observed_counts, expected_total))
+                - np.sum(expected_total)
+                - self._log_factorial_counts_sum)
 
 
 def extended_loglikelihood(mu, ps, outlier_likelihood=0.0):
