@@ -18,12 +18,14 @@ from .parallel import create_models_ipyparallel, compute_many
 from .utils import combine_dicts, inherit_docstring_from
 from . import inference
 
-from .pdf_morphers import GridInterpolator, MultilinearGridInterpolator, RadialInterpolator
+from .pdf_morphers import (GridInterpolator, CubicHermiteInterpolator, MultilinearGridInterpolator,
+                           RadialInterpolator)
 from .pdf_morphers_cubic import CubicSplineInterpolator
-MORPHERS = {x.__name__: x for x in [GridInterpolator, RadialInterpolator, CubicSplineInterpolator]}
+MORPHERS = {x.__name__: x for x in [GridInterpolator, RadialInterpolator, CubicSplineInterpolator,
+                                    CubicHermiteInterpolator]}
 
 __all__ = ['LogLikelihoodBase', 'BinnedLogLikelihood', 'UnbinnedLogLikelihood', 'LogLikelihoodSum',
-           'LogLikelihoodReParam']
+           'LogLikelihoodReParam', 'SourceShapeInterpolator']
 
 
 ##
@@ -583,6 +585,12 @@ class BinnedLogLikelihood(LogLikelihoodBase):
         pdf_base_config['pdf_interpolation_method'] = 'piecewise'
 
         self.model_statistical_uncertainty_handling = self.config.get('model_statistical_uncertainty_handling')
+        if self.config['morpher'] == 'CubicHermiteInterpolator' and not self.source_wise_interpolation:
+            # its interpolation does not preserve the pmf normalization; source-wise
+            # interpolation restores it (see SourceShapeInterpolator)
+            raise ValueError("CubicHermiteInterpolator in a binned likelihood requires "
+                             "source_wise_interpolation")
+        self.source_interpolators = OrderedDict()  # source name -> SourceShapeInterpolator
 
     @inherit_docstring_from(LogLikelihoodBase)
     def prepare(self, *args):
@@ -591,7 +599,8 @@ class BinnedLogLikelihood(LogLikelihoodBase):
 
         if len(self.shape_parameters):
             if self.source_wise_interpolation:
-                raise NotImplementedError("Source-wise interpolation not implemented for binned likelihoods")
+                self._prepare_source_wise_interpolation()
+                return
 
             self.ps_interpolator = self.morpher.make_interpolator(
                 f=lambda m: m.pmf_grids()[0],
@@ -602,6 +611,36 @@ class BinnedLogLikelihood(LogLikelihoodBase):
                 self.n_model_events_interpolator = self.morpher.make_interpolator(f=lambda m: m.pmf_grids()[1],
                                                                                 extra_dims=list(self.ps.shape),
                                                                                 anchor_models=self.anchor_models)
+
+    def _prepare_source_wise_interpolation(self):
+        """Interpolate the rate and pmf of each source separately, only in the shape parameters
+        the source depends on (anchor models from LogLikelihoodBase.prepare)."""
+        if self.model_statistical_uncertainty_handling is not None:
+            raise NotImplementedError("Source-wise interpolation does not support "
+                                      "model_statistical_uncertainty_handling")
+        for source_name, morpher in self.source_morphers.items():
+            self.source_interpolators[source_name] = SourceShapeInterpolator(
+                morpher,
+                anchor_sources=self.anchor_sources[source_name],
+                source_index=self.source_name_list.index(source_name),
+                shape_indices=self._get_shape_indices(source_name),
+                pmf_shape=self.ps.shape[1:])
+        self.mus_interpolator = self._source_wise_rates
+        self.ps_interpolator = self._source_wise_pmfs
+
+    def _source_wise_rates(self, zs):
+        """Expected events of all sources at shape parameters zs (source-wise interpolation)."""
+        mus = np.array(self.base_model.expected_events(), dtype=float)
+        for interpolator in self.source_interpolators.values():
+            mus[interpolator.source_index] = interpolator.rate(zs)
+        return mus
+
+    def _source_wise_pmfs(self, zs):
+        """Pmfs of all sources at shape parameters zs (source-wise interpolation)."""
+        ps = self.ps.copy()
+        for interpolator in self.source_interpolators.values():
+            ps[interpolator.source_index] = interpolator.pmf(zs)
+        return ps
 
     @inherit_docstring_from(LogLikelihoodBase)
     def set_data(self, d):
@@ -712,10 +751,12 @@ class BinnedLogLikelihood(LogLikelihoodBase):
             return False
         if any(self.source_allowed_negative):
             return False
-        if len(self.shape_parameters):
-            return (isinstance(self.ps_interpolator, MultilinearGridInterpolator)
-                    and isinstance(self.mus_interpolator, MultilinearGridInterpolator))
-        return True
+        if not len(self.shape_parameters):
+            return True
+        if self.source_wise_interpolation:
+            return all(i.supports_gradient() for i in self.source_interpolators.values())
+        return (isinstance(self.ps_interpolator, MultilinearGridInterpolator)
+                and isinstance(self.mus_interpolator, MultilinearGridInterpolator))
 
     @_needs_data
     def loglikelihood_and_gradient(self, livetime_days=None, **kwargs):
@@ -723,8 +764,13 @@ class BinnedLogLikelihood(LogLikelihoodBase):
 
         The gradient is a dict with an entry for every rate multiplier
         (<source>_rate_multiplier) and every shape parameter of this likelihood. For shape
-        parameters it is the derivative of the multilinear interpolation (one-sided at anchors).
-        Only for the configurations accepted by supports_gradient().
+        parameters it is the derivative of the interpolation (for multilinear interpolation
+        one-sided at the anchors). Only for the configurations accepted by supports_gradient().
+
+        With expected events lambda_b = sum_s M_s p_sb in bin b, where M_s is the rate of source s
+        (interpolated rate x rate multiplier x live-time scale x efficiency) and p_sb its pmf:
+            d ll / d lambda_b = n_b / lambda_b - 1
+            d ll / d z = sum_b (d ll / d lambda_b) sum_s (dM_s/dz p_sb + M_s dp_sb/dz)
         """
         if not self.supports_gradient():
             raise NotImplementedError("Gradient not available for this likelihood configuration")
@@ -735,7 +781,7 @@ class BinnedLogLikelihood(LogLikelihoodBase):
         zero_gradient = {sn + '_rate_multiplier': 0. for sn in self.source_name_list}
         zero_gradient.update({sn: 0. for sn in shape_names})
 
-        # Interpolate rates and pmfs (as __call__), keeping the corner weights for the gradient
+        # Interpolate rates and pmfs (as __call__), keeping what is needed for their derivatives
         if len(shape_names):
             zs = []
             for setting_name in shape_names:
@@ -744,15 +790,26 @@ class BinnedLogLikelihood(LogLikelihoodBase):
                 if not minbound <= z <= maxbound:
                     return -float('inf'), zero_gradient
                 zs.append(z)
-            rows, weights, weight_gradients = self.ps_interpolator.corner_weights(np.asarray(zs))
-            ps = self.ps_interpolator.combine(rows, weights).reshape(self.ps.shape)
-            mus_anchor = self.mus_interpolator.values[rows]  # (n_corners, n_sources)
-            mus = weights @ mus_anchor
+            zs = np.asarray(zs)
+            if self.source_wise_interpolation:
+                mus = np.array(self.base_model.expected_events(), dtype=float)
+                ps = self.ps.copy()
+                source_derivatives = []
+                for interpolator in self.source_interpolators.values():
+                    rate, pmf, rate_gradient, pmf_gradient = interpolator.values_and_gradients(zs)
+                    mus[interpolator.source_index] = rate
+                    ps[interpolator.source_index] = pmf
+                    source_derivatives.append((interpolator, rate_gradient, pmf_gradient))
+            else:
+                rows, weights, weight_gradients = self.ps_interpolator.corner_weights(zs)
+                ps = self.ps_interpolator.combine(rows, weights).reshape(self.ps.shape)
+                mus_anchor = self.mus_interpolator.values[rows]  # (n_corners, n_sources)
+                mus = weights @ mus_anchor
         else:
             ps = self.ps
             mus = np.asarray(self.base_model.expected_events(), dtype=float).copy()
 
-        # Everything multiplying the interpolated rate of each source: M_s = mus_s * factor_s
+        # Everything multiplying the interpolated rate of each source: M_s = mus_s * factor_s * eff_s
         livetime_scale = 1.
         if livetime_days is not None:
             if 'livetime_days' not in self.pdf_base_config:
@@ -784,8 +841,9 @@ class BinnedLogLikelihood(LogLikelihoodBase):
         expected_total = np.einsum('s,s...->...', expected, ps)
         with np.errstate(divide='ignore', invalid='ignore'):
             dll_dlambda = np.where(observed_counts > 0, observed_counts / expected_total, 0.) - 1.
+        dll_dlambda_flat = dll_dlambda.ravel()
         # A_s = sum_b dll/dlambda_b * p_sb
-        a_s = np.einsum('sb,b->s', ps.reshape(n_sources, -1), dll_dlambda.ravel())
+        a_s = np.einsum('sb,b->s', ps.reshape(n_sources, -1), dll_dlambda_flat)
 
         gradient = {}
         # rate multipliers: d M_s / d r_s = mus_s * livetime_scale * eff_s
@@ -794,15 +852,25 @@ class BinnedLogLikelihood(LogLikelihoodBase):
                 a_s[source_i] * mus[source_i] * livetime_scale * efficiencies[source_i]
 
         if len(shape_names):
-            # d lambda_b / d z_k = sum_c dw_ck [ sum_s mus_cs f_s e_s p_sb + sum_s M_s P_csb ]
-            pmf_size = ps[0].size
-            dll_dlambda_flat = dll_dlambda.ravel()
-            per_corner = np.empty(len(rows))
-            for c, row_i in enumerate(rows):
-                pmf_c = self.ps_interpolator.values[row_i].reshape(n_sources, pmf_size)
-                per_corner[c] = (np.dot(mus_anchor[c] * factor * efficiencies, a_s)
-                                 + np.dot(expected, np.einsum('sb,b->s', pmf_c, dll_dlambda_flat)))
-            shape_gradient = per_corner @ weight_gradients
+            if self.source_wise_interpolation:
+                shape_gradient = np.zeros(len(shape_names))
+                for interpolator, rate_gradient, pmf_gradient in source_derivatives:
+                    # d ll / d z_k from this source, for the shape parameters it depends on
+                    source_i = interpolator.source_index
+                    scale = factor[source_i] * efficiencies[source_i]
+                    pmf_term = np.einsum('kb,b->k', pmf_gradient.reshape(len(rate_gradient), -1),
+                                         dll_dlambda_flat)
+                    shape_gradient[interpolator.shape_indices] += scale * (
+                        rate_gradient * a_s[source_i] + mus[source_i] * pmf_term)
+            else:
+                # d lambda_b / d z_k = sum_c dw_ck [ sum_s mus_cs f_s e_s p_sb + sum_s M_s P_csb ]
+                pmf_size = ps[0].size
+                per_corner = np.empty(len(rows))
+                for c, row_i in enumerate(rows):
+                    pmf_c = self.ps_interpolator.values[row_i].reshape(n_sources, pmf_size)
+                    per_corner[c] = (np.dot(mus_anchor[c] * factor * efficiencies, a_s)
+                                     + np.dot(expected, np.einsum('sb,b->s', pmf_c, dll_dlambda_flat)))
+                shape_gradient = per_corner @ weight_gradients
             for k, setting_name in enumerate(shape_names):
                 gradient[setting_name] = shape_gradient[k]
 
@@ -814,6 +882,90 @@ class BinnedLogLikelihood(LogLikelihoodBase):
                     gradient[sen] += a_s[source_i] * mus[source_i] * factor[source_i]
         return ll, gradient
 
+
+class SourceShapeInterpolator:
+    """Rate and pmf of one source, interpolated in the shape parameters this source depends on.
+
+    Used by BinnedLogLikelihood with source_wise_interpolation. Methods take the values of all
+    shape parameters of the likelihood (zs) and pick out those of this source (shape_indices);
+    gradients are with respect to this source's shape parameters, in the order of shape_indices.
+
+    The pmf, the expected events and the pmf normalization of the anchor sources are interpolated
+    together, as one vector [pmf bins..., expected events, normalization], so that the grid cell
+    and interpolation weights are found only once per evaluation.
+
+    If the morpher's interpolation does not preserve sums over the outputs (preserves_sums False,
+    e.g. CubicHermiteInterpolator), the interpolated pmf p is rescaled to the interpolated
+    normalization N of the anchor pmfs: p * N / sum(p). Pmfs normalized at all anchors thus stay
+    normalized; differing anchor normalizations are interpolated smoothly.
+    """
+
+    def __init__(self, morpher, anchor_sources, source_index, shape_indices, pmf_shape):
+        """
+        :param morpher: morpher of this source (over its shape parameters only)
+        :param anchor_sources: dict {anchor z-scores of this source: Source}
+        :param source_index: index of the source in the likelihood's source list
+        :param shape_indices: indices of this source's shape parameters among all shape parameters
+        :param pmf_shape: shape of the pmf (analysis space bins)
+        """
+        self.source_index = source_index
+        self.shape_indices = list(shape_indices)
+        self.pmf_shape = tuple(pmf_shape)
+        self.pmf_size = int(np.prod(self.pmf_shape))
+        self.interpolator = morpher.make_interpolator(
+            f=self._anchor_vector, extra_dims=[self.pmf_size + 2], anchor_models=anchor_sources)
+        self.renormalize = not getattr(self.interpolator, 'preserves_sums', True)
+        self._last_evaluation = (None, None)  # (zs of this source, (rate, pmf))
+
+    def _anchor_vector(self, source):
+        pmf = source.get_pmf_grid()[0]
+        return np.concatenate([pmf.ravel(), [source.expected_events, pmf.sum()]])
+
+    def _own_zs(self, zs):
+        return np.asarray([zs[i] for i in self.shape_indices], dtype=float)
+
+    def supports_gradient(self):
+        return hasattr(self.interpolator, 'value_and_gradient')
+
+    def _evaluate(self, zs):
+        """(rate, pmf) at zs. The last result is kept, since the likelihood asks for the rates
+        and the pmfs of all sources separately."""
+        z = self._own_zs(zs)
+        if self._last_evaluation[0] != tuple(z):
+            vector = self.interpolator(z)
+            pmf = vector[:self.pmf_size].reshape(self.pmf_shape)
+            rate, normalization = vector[self.pmf_size:]
+            total = pmf.sum()
+            if self.renormalize and total > 0:
+                pmf = pmf * (normalization / total)
+            self._last_evaluation = (tuple(z), (rate, pmf))
+        return self._last_evaluation[1]
+
+    def rate(self, zs):
+        """Expected events of the source at zs."""
+        return self._evaluate(zs)[0]
+
+    def pmf(self, zs):
+        """Pmf of the source at zs (a new array)."""
+        return self._evaluate(zs)[1].copy()
+
+    def values_and_gradients(self, zs):
+        """Return rate, pmf and their gradients, shapes (k,) and (k, *pmf_shape), at zs."""
+        z = self._own_zs(zs)
+        vector, vector_gradient = self.interpolator.value_and_gradient(z)
+        n = self.pmf_size
+        pmf, rate, normalization = vector[:n], vector[n], vector[n + 1]
+        pmf_gradient, rate_gradient, normalization_gradient = \
+            vector_gradient[:, :n], vector_gradient[:, n], vector_gradient[:, n + 1]
+        total = pmf.sum()
+        if self.renormalize and total > 0:
+            # pmf * scale with scale = normalization / total: product and quotient rule
+            scale = normalization / total
+            scale_gradient = (normalization_gradient - scale * pmf_gradient.sum(axis=1)) / total
+            pmf_gradient = pmf_gradient * scale + scale_gradient[:, None] * pmf[None, :]
+            pmf = pmf * scale
+        return (rate, pmf.reshape(self.pmf_shape), rate_gradient,
+                pmf_gradient.reshape((len(z),) + self.pmf_shape))
 
 def extended_loglikelihood(mu, ps, outlier_likelihood=0.0):
     """Evaluate an extended unbinned likelihood function
