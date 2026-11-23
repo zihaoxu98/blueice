@@ -1,6 +1,7 @@
 """Tests for MultilinearGridInterpolator and the analytic gradient of BinnedLogLikelihood."""
 import numpy as np
 import pytest
+from scipy import stats
 from scipy.interpolate import RegularGridInterpolator
 
 from blueice.likelihood import BinnedLogLikelihood, LogLikelihoodSum
@@ -161,3 +162,57 @@ def test_no_gradient_for_beeston_barlow():
     assert not lf.supports_gradient()
     with pytest.raises(NotImplementedError):
         lf.loglikelihood_and_gradient()
+
+
+def test_binned_gradient_with_efficiency():
+    conf = conf_for_test(n_sources=2, mc=True, n_events_for_pdf=int(2e5),
+                         analysis_space=[['x', np.linspace(-10, 10, 41)]])
+    conf['sources'][1]['sigma'] = 3
+    conf['sources'][0]['apply_efficiency'] = True
+    conf['sources'][0]['efficiency_name'] = 'eff'
+    conf['eff'] = 1.
+    lf = BinnedLogLikelihood(conf)
+    lf.add_rate_parameter('s0')
+    lf.add_rate_parameter('s1')
+    lf.add_shape_parameter('eff', (0.2, 1.5))
+    lf.prepare()
+    data = np.zeros(3000, dtype=[('x', float), ('source', int)])
+    data['x'] = np.random.RandomState(0).normal(0.2, 2, len(data))
+    lf.set_data(data)
+    assert lf.supports_gradient()
+    kwargs = dict(s0_rate_multiplier=1.3, s1_rate_multiplier=0.7, eff=0.8)
+    value, gradient = lf.loglikelihood_and_gradient(**kwargs)
+    assert value == pytest.approx(lf(**kwargs), abs=1e-9)
+    for name in kwargs:
+        assert gradient[name] == pytest.approx(numeric_gradient(lf, name, kwargs), rel=1e-5), name
+
+
+def test_full_output_does_not_expose_internal_arrays():
+    lf = make_binned_likelihood(shape=False)
+    reference = lf()
+    _, mus, ps = lf(full_output=True)
+    mus *= 0
+    ps *= 0
+    assert lf() == reference
+
+
+def test_data_modified_in_place():
+    lf = make_binned_likelihood(shape=False)
+    lf()
+    lf.data_events_per_bin.histogram[20] += 5
+    expected = (np.einsum('s,s...->...', *lf(full_output=True)[1:]))
+    reference = np.sum(stats.poisson(expected).logpmf(lf.data_events_per_bin.histogram))
+    assert lf() == pytest.approx(reference, abs=1e-8)
+
+
+def test_no_gradient_for_subclasses_changing_the_likelihood():
+    class ModifiedLikelihood(BinnedLogLikelihood):
+        def _compute_likelihood(self, mus, pmfs):
+            return 2 * super()._compute_likelihood(mus, pmfs)
+
+    conf = conf_for_test(n_sources=1, mc=True, analysis_space=[['x', np.linspace(-5, 5, 6)]])
+    lf = ModifiedLikelihood(conf)
+    lf.add_rate_parameter('s0')
+    lf.prepare()
+    lf.set_data(np.zeros(5, dtype=[('x', float), ('source', int)]))
+    assert not lf.supports_gradient()

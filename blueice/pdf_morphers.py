@@ -1,6 +1,7 @@
 """Morphers: interpolate multidimensional functions of models
 """
 import numpy as np
+from scipy.interpolate import RegularGridInterpolator  # noqa: F401 (kept for importers)
 from scipy.spatial import KDTree
 from tqdm import tqdm
 

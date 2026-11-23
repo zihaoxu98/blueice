@@ -622,8 +622,9 @@ class BinnedLogLikelihood(LogLikelihoodBase):
     @inherit_docstring_from(LogLikelihoodBase)
     def adjust_expectations(self, mus, pmfs, n_model_events):
         if self.model_statistical_uncertainty_handling is None:
-            # Nothing to adjust; _compute_likelihood does not mutate its inputs, so no copies needed
-            return mus, pmfs
+            # Nothing to adjust. The returned arrays may be handed out (full_output), so never
+            # return internal arrays; interpolated pmfs are already fresh arrays.
+            return mus.copy(), (pmfs.copy() if pmfs is self.ps else pmfs)
 
         # Avoid mutating the arrays we're also going to return
         mus = mus.copy()
@@ -681,17 +682,28 @@ class BinnedLogLikelihood(LogLikelihoodBase):
             return np.nan
 
         # Poisson log pmf, k log(mu) - mu - log(k!), same conventions as scipy.stats.poisson.logpmf
-        # (xlogy gives 0 for k = mu = 0, -inf for k > 0 = mu). log(k!) only depends on the data.
-        if getattr(self, '_log_factorial_counts_of', None) is not observed_counts:
-            self._log_factorial_counts_sum = np.sum(special.gammaln(observed_counts + 1))
-            self._log_factorial_counts_of = observed_counts
+        # (xlogy gives 0 for k = mu = 0, -inf for k > 0 = mu). sum log(k!) only depends on the
+        # data; it is cached together with a copy of the counts, so that replacing or modifying
+        # the data histogram in place is detected.
+        cached = getattr(self, '_log_factorial_cache', None)
+        if cached is None or not np.array_equal(cached[0], observed_counts):
+            cached = (np.array(observed_counts, copy=True),
+                      np.sum(special.gammaln(observed_counts + 1)))
+            self._log_factorial_cache = cached
         return (np.sum(special.xlogy(observed_counts, expected_total))
                 - np.sum(expected_total)
-                - self._log_factorial_counts_sum)
+                - cached[1])
 
+
+    # methods the analytic gradient reproduces; subclasses overriding them do not get gradients
+    _GRADIENT_REQUIRES_METHODS = ('__call__', '_kwargs_to_settings', 'adjust_expectations',
+                                  '_compute_likelihood', 'get_bounds')
 
     def supports_gradient(self):
         """Whether loglikelihood_and_gradient can be used for this likelihood."""
+        for name in self._GRADIENT_REQUIRES_METHODS:
+            if getattr(type(self), name) is not getattr(BinnedLogLikelihood, name):
+                return False
         if self.model_statistical_uncertainty_handling is not None or self._has_non_numeric:
             return False
         if any(lp is not None for lp in self.rate_parameters.values()):
