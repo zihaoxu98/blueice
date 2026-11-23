@@ -153,13 +153,13 @@ def test_source_wise_cubic_hermite(tmp_path, monkeypatch):
     for point in POINTS:
         zs = [point['mu'], point['some_multiplier']]
         expected_sum = s0.interpolator(np.array(zs))[-1]  # interpolated anchor normalization
-        assert s0.pmf(zs).sum() == pytest.approx(expected_sum, rel=1e-12)
+        assert s0.density(zs).sum() == pytest.approx(expected_sum, rel=1e-12)
         check_gradient(lf, point)
 
     # exact at the anchors
     for (mu, some_multiplier), source in lf.anchor_sources['s0'].items():
         zs = [mu, some_multiplier]
-        np.testing.assert_allclose(s0.pmf(zs), source.get_pmf_grid()[0], rtol=1e-12, atol=1e-15)
+        np.testing.assert_allclose(s0.density(zs), source.get_pmf_grid()[0], rtol=1e-12, atol=1e-15)
         assert s0.rate(zs) == pytest.approx(source.expected_events, rel=1e-12)
 
     # no kink at the anchor mu = 0

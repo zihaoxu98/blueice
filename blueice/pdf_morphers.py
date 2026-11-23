@@ -14,6 +14,10 @@ __all__ = ['Morpher', 'GridInterpolator', 'CubicHermiteInterpolator', 'RadialInt
 
 class Morpher(object):
 
+    # Whether the interpolation preserves sums over its outputs, e.g. the normalization of
+    # interpolated pdfs. If not, source-wise interpolation renormalizes (SourceShapeInterpolator).
+    preserves_sums = True
+
     def __init__(self, config, shape_parameters):
         """Initialize the morpher, telling it which shape_parameters we're going to use
         See model for format of shape_parameters
@@ -338,6 +342,8 @@ class CubicHermiteInterpolator(GridInterpolator):
     gradients and gradient-based minimizers behave well. In a binned likelihood it requires
     source_wise_interpolation, which also keeps the interpolated pmfs normalized.
     """
+
+    preserves_sums = False
 
     @inherit_docstring_from(Morpher)
     def make_interpolator(self, f, extra_dims, anchor_models):
