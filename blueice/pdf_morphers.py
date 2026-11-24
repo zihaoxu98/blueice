@@ -1,7 +1,6 @@
 """Morphers: interpolate multidimensional functions of models
 """
 import numpy as np
-from scipy.interpolate import PchipInterpolator
 from scipy.interpolate import RegularGridInterpolator  # noqa: F401 (kept for importers)
 from scipy.spatial import KDTree
 from tqdm import tqdm
@@ -207,11 +206,46 @@ def pchip_slopes(grid, values, axis=0):
     PCHIP (Fritsch-Carlson, as scipy.interpolate.PchipInterpolator) chooses the slopes such that the
     cubic Hermite interpolant is monotone between neighbouring grid points: it never overshoots
     the values at the grid points. Each output (e.g. each bin) gets its own slopes.
+
+    This is the slope rule of scipy's PchipInterpolator, evaluated for all outputs at once without
+    building a piecewise polynomial: the slopes are zero where the neighbouring secants have
+    different signs or one is zero, else their weighted harmonic mean; the end slopes are the
+    shape-preserving one-sided three-point estimates of Moler, Numerical Computing with MATLAB.
     """
     grid = np.asarray(grid, dtype=float)
+    values = np.asarray(values, dtype=float)
     if len(grid) == 1:
         return np.zeros_like(values)
-    return PchipInterpolator(grid, values, axis=axis).derivative()(grid)
+    y = np.moveaxis(values, axis, 0)
+    shape = y.shape
+    y = y.reshape(len(grid), -1)
+    h = np.diff(grid)[:, None]
+    secant = np.diff(y, axis=0) / h
+    slopes = np.empty_like(y)
+    if len(grid) == 2:
+        slopes[:] = secant
+    else:
+        m0, m1 = secant[:-1], secant[1:]
+        sign0, sign1 = np.sign(m0), np.sign(m1)
+        w1 = 2 * h[1:] + h[:-1]
+        w2 = h[1:] + 2 * h[:-1]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            interior = 1.0 / ((w1 / m0 + w2 / m1) / (w1 + w2))
+        slopes[1:-1] = np.where((sign0 != sign1) | (m0 == 0) | (m1 == 0), 0.0, interior)
+        slopes[0] = _pchip_end_slope(h[0], h[1], secant[0], secant[1])
+        slopes[-1] = _pchip_end_slope(h[-1], h[-2], secant[-1], secant[-2])
+    return np.moveaxis(slopes.reshape(shape), 0, axis)
+
+
+def _pchip_end_slope(h0, h1, m0, m1):
+    """Shape-preserving one-sided three-point estimate of the slope at an end point of the grid
+    (h0, h1: the two nearest cell widths; m0, m1: the two nearest secants)."""
+    slope = ((2 * h0 + h1) * m0 - h0 * m1) / (h0 + h1)
+    # Keep the sign of the nearest secant, and limit the size if the secants change sign
+    wrong_sign = np.sign(slope) != np.sign(m0)
+    too_large = (np.sign(m0) != np.sign(m1)) & (np.abs(slope) > 3. * np.abs(m0))
+    slope = np.where(wrong_sign, 0., slope)
+    return np.where(~wrong_sign & too_large, 3. * m0, slope)
 
 
 class CubicHermiteGridInterpolator(MultilinearGridInterpolator):

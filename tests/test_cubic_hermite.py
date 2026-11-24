@@ -209,3 +209,28 @@ def test_sum_outputs_equals_sum_of_interpolated_outputs(n_dims):
         np.testing.assert_allclose(c_gradient[:, 5], gradient[:, 5:35].sum(axis=1),
                                    rtol=1e-10, atol=1e-12)
         np.testing.assert_allclose(collapsed(z), c_value)
+
+
+@pytest.mark.parametrize("n_points", [2, 3, 4, 7])
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_pchip_slopes_equal_scipy(n_points, axis):
+    """pchip_slopes is the slope rule of scipy's PchipInterpolator, including flat segments, sign
+    changes, zeros and uneven grids."""
+    from blueice.pdf_morphers import pchip_slopes
+    rng = np.random.default_rng(100 * n_points + axis)
+    grid = np.sort(rng.choice(np.linspace(-3, 3, 25), n_points, replace=False))
+    shape = [5, 6, 7]
+    shape[axis] = n_points
+    values = rng.normal(size=shape)
+    values[rng.random(shape) < 0.3] = 0.                      # zeros
+    values = np.where(rng.random(shape) < 0.2, np.round(values), values)   # repeated values (flat segments)
+    values = np.where(rng.random(shape) < 0.5, np.abs(values), values)     # many monotone columns
+    expected = PchipInterpolator(grid, values, axis=axis).derivative()(grid)
+    result = pchip_slopes(grid, values, axis=axis)
+    assert result.shape == values.shape
+    np.testing.assert_allclose(result, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_pchip_slopes_one_point_is_zero():
+    from blueice.pdf_morphers import pchip_slopes
+    np.testing.assert_array_equal(pchip_slopes([0.], np.ones((1, 4))), np.zeros((1, 4)))
