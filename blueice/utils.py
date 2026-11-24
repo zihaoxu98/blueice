@@ -4,7 +4,7 @@ import pickle
 import pickle as _builtin_pickle
 import dill as pickle
 from hashlib import sha1
-from atomicwrites import atomic_write
+from atomicwrites import atomic_write, AtomicWriter
 
 import numpy as np
 from scipy.interpolate import interp1d
@@ -68,12 +68,27 @@ def read_pickle(filename):
     return result
 
 
+class _AtomicWriterWithoutFsync(AtomicWriter):
+    """Atomic writer (write to a temporary file, then rename) that does not fsync the file."""
+
+    def sync(self, f):
+        f.flush()
+
+
 def save_pickle(stuff, filename):
-    """Saves stuff in a pickle at filename"""
+    """Saves stuff in a pickle at filename.
+
+    The file is written atomically and fsynced. Setting the environment variable
+    BLUEICE_CACHE_FSYNC=0 skips the fsync, which can dominate the time to fill the pdf cache on
+    slow shared file systems (the cache can be regenerated; the risk is a lost or truncated file
+    only if the machine itself crashes, not if the process is killed).
+    """
     dirname = os.path.dirname(filename)
     if dirname != '' and not os.path.exists(dirname):
         os.makedirs(dirname)
-    with atomic_write(filename, mode="wb", overwrite=True) as outfile:
+    writer = AtomicWriter if os.environ.get('BLUEICE_CACHE_FSYNC', '1') != '0' \
+        else _AtomicWriterWithoutFsync
+    with atomic_write(filename, writer_cls=writer, mode="wb", overwrite=True) as outfile:
         pickle.dump(stuff, outfile)
 
 
