@@ -234,3 +234,21 @@ def test_pchip_slopes_equal_scipy(n_points, axis):
 def test_pchip_slopes_one_point_is_zero():
     from blueice.pdf_morphers import pchip_slopes
     np.testing.assert_array_equal(pchip_slopes([0.], np.ones((1, 4))), np.zeros((1, 4)))
+
+
+def test_insert_outputs_restores_summed_outputs():
+    """Rows of a sum computed once by sum_outputs can be inserted into another interpolator on
+    the same grid, giving exactly what sum_outputs on the whole would."""
+    rng = np.random.default_rng(5)
+    grids = random_grids(rng, 2)
+    scores = rng.uniform(0.01, 1, size=tuple(len(g) for g in grids) + (12,))
+    reference = CubicHermiteGridInterpolator(grids, scores)
+    reference.sum_outputs(slice(3, 9))
+    summed = CubicHermiteGridInterpolator(grids, scores[..., 3:9])
+    summed.sum_outputs(slice(0, 6))
+    rest = CubicHermiteGridInterpolator(grids, np.concatenate([scores[..., :3], scores[..., 9:]], axis=-1))
+    rest.insert_outputs(3, summed.values)
+    np.testing.assert_array_equal(rest.values, reference.values)
+    assert rest.output_shape == reference.output_shape
+    with pytest.raises(ValueError):
+        rest.insert_outputs(3, summed.values[:-1])

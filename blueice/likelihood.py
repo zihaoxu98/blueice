@@ -635,13 +635,16 @@ class UnbinnedLogLikelihood(LogLikelihoodBase):
                 events = self.base_model.to_analysis_dimensions(d)
                 self.ps = self.base_model.score_events(d)
                 self.source_interpolators = OrderedDict()
+                # what does not depend on the data is kept between data sets, per source
+                pmf_sum_caches = self.__dict__.setdefault('_pmf_sum_caches', {})
                 for source_name, morpher in self.source_morphers.items():
                     self.source_interpolators[source_name] = SourceShapeInterpolator(
                         morpher,
                         anchor_sources=self.anchor_sources[source_name],
                         source_index=self.source_name_list.index(source_name),
                         shape_indices=self.source_shape_indices[source_name],
-                        events=events)
+                        events=events,
+                        pmf_sum_cache=pmf_sum_caches.setdefault(source_name, {}))
                 self.mus_interpolator = self._source_wise_rates
                 self.ps_interpolator = self._source_wise_densities
             else:
@@ -1013,7 +1016,8 @@ class SourceShapeInterpolator:
     preserve sums, unbinned likelihoods do not need the pmf grid at all.
     """
 
-    def __init__(self, morpher, anchor_sources, source_index, shape_indices, events=None):
+    def __init__(self, morpher, anchor_sources, source_index, shape_indices, events=None,
+                 pmf_sum_cache=None):
         """
         :param morpher: morpher of this source (over its shape parameters only)
         :param anchor_sources: dict {anchor z-scores of this source: Source}
@@ -1021,6 +1025,11 @@ class SourceShapeInterpolator:
         :param shape_indices: indices of this source's shape parameters among all shape parameters
         :param events: for unbinned likelihoods, the events in analysis-space coordinates
                        (a tuple of arrays, as passed to Source.pdf); None for binned likelihoods
+        :param pmf_sum_cache: optional dict, kept by the caller between data sets of the same
+                              anchor models. Unbinned likelihoods that renormalize only need the sum
+                              of the interpolated pmf, which does not depend on the events: its
+                              stored interpolation rows are computed once and kept here, so that a
+                              new data set only interpolates the quantities that depend on the events
         """
         self.source_index = source_index
         self.shape_indices = list(shape_indices)
@@ -1039,18 +1048,45 @@ class SourceShapeInterpolator:
         sizes['rate'] = 1
         if self.renormalize:
             sizes['normalization'] = 1
-        self._slices, n_outputs = self._layout(sizes)
-
-        self.interpolator = morpher.make_interpolator(
-            f=self._anchor_vector, extra_dims=[n_outputs], anchor_models=anchor_sources)
-        if events is not None and self.renormalize and hasattr(self.interpolator, 'sum_outputs'):
-            # Unbinned: only the sum of the interpolated pmf is needed (to renormalize the pdf at
-            # the events), not the pmf itself. Interpolate just that sum, which is exactly the sum
-            # of the interpolated pmf but costs O(1) instead of O(n_bins) per evaluation.
-            self.interpolator.sum_outputs(self._slices['pmf'])
+        pmf_sum_rows = None
+        if events is not None and self.renormalize and pmf_sum_cache is not None:
+            pmf_sum_rows = self._pmf_sum_rows(morpher, anchor_sources, sizes['pmf'], pmf_sum_cache)
+        if pmf_sum_rows is not None:
+            # Interpolate everything but the pmf, then add the stored rows of its sum
+            self._slices, n_outputs = self._layout(
+                OrderedDict((name, size) for name, size in sizes.items() if name != 'pmf'))
+            self.interpolator = morpher.make_interpolator(
+                f=self._anchor_vector, extra_dims=[n_outputs], anchor_models=anchor_sources)
+            self.interpolator.insert_outputs(self._slices['pdf'].stop, pmf_sum_rows)
             sizes['pmf'] = 1
             self._slices, _ = self._layout(sizes)
+        else:
+            self._slices, n_outputs = self._layout(sizes)
+            self.interpolator = morpher.make_interpolator(
+                f=self._anchor_vector, extra_dims=[n_outputs], anchor_models=anchor_sources)
+            if events is not None and self.renormalize and hasattr(self.interpolator, 'sum_outputs'):
+                # Unbinned: only the sum of the interpolated pmf is needed (to renormalize the pdf
+                # at the events), not the pmf itself. Interpolate just that sum, which is exactly
+                # the sum of the interpolated pmf but costs O(1) instead of O(n_bins) per call.
+                self.interpolator.sum_outputs(self._slices['pmf'])
+                sizes['pmf'] = 1
+                self._slices, _ = self._layout(sizes)
         self._last_evaluation = (None, None)  # (zs of this source, result of _evaluate)
+
+    @staticmethod
+    def _pmf_sum_rows(morpher, anchor_sources, n_bins, cache):
+        """Stored interpolation rows of the sum of the pmf, or None if the morpher's interpolator
+        cannot sum and insert outputs. Computed once per set of anchor models and kept in cache."""
+        entry = cache.get('pmf_sum_rows')
+        if entry is None or entry[0] is not anchor_sources:
+            interpolator = morpher.make_interpolator(
+                f=lambda source: source.get_pmf_grid()[0].ravel(), extra_dims=[n_bins],
+                anchor_models=anchor_sources)
+            if not (hasattr(interpolator, 'sum_outputs') and hasattr(interpolator, 'insert_outputs')):
+                return None
+            interpolator.sum_outputs(slice(0, n_bins))
+            entry = cache['pmf_sum_rows'] = (anchor_sources, interpolator.values)
+        return entry[1]
 
     @staticmethod
     def _layout(sizes):
@@ -1062,7 +1098,7 @@ class SourceShapeInterpolator:
         return slices, start
 
     def _anchor_vector(self, source):
-        parts = []
+        parts, pmf = [], None
         if 'pdf' in self._slices:
             parts.append(source.pdf(*self.events))
         if 'pmf' in self._slices:
@@ -1070,6 +1106,8 @@ class SourceShapeInterpolator:
             parts.append(pmf.ravel())
         parts.append([source.expected_events])
         if 'normalization' in self._slices:
+            if pmf is None:
+                pmf = source.get_pmf_grid()[0]
             parts.append([pmf.sum()])
         return np.concatenate(parts)
 

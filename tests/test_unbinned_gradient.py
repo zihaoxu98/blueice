@@ -6,7 +6,14 @@ from blueice.likelihood import UnbinnedLogLikelihood
 from blueice.test_helpers import conf_for_test
 
 
-def make_likelihood(source_wise, morpher='GridInterpolator', shape=True, mc=True):
+def make_data(seed=0):
+    data = np.zeros(500, dtype=[('x', float), ('source', int)])
+    data['x'] = np.random.RandomState(seed).normal(0.2, 2, len(data))
+    data['x'][:3] = 9.9  # far in the tail: no MC events there, outlier events
+    return data
+
+
+def make_likelihood(source_wise, morpher='GridInterpolator', shape=True, mc=True, seed=0):
     """s0 depends on both shape parameters, s1 only on some_multiplier.
 
     mc=True: histogram (MC) sources, needed for the C1 interpolation, which renormalizes with
@@ -24,10 +31,7 @@ def make_likelihood(source_wise, morpher='GridInterpolator', shape=True, mc=True
         lf.add_shape_parameter('mu', (-1., 0., 1., 2.))
         lf.add_shape_parameter('some_multiplier', (0.5, 1., 2.))
     lf.prepare()
-    data = np.zeros(500, dtype=[('x', float), ('source', int)])
-    data['x'] = np.random.RandomState(0).normal(0.2, 2, len(data))
-    data['x'][:3] = 9.9  # far in the tail: no MC events there, outlier events
-    lf.set_data(data)
+    lf.set_data(make_data(seed))
     return lf
 
 
@@ -133,3 +137,39 @@ def test_no_gradient_for_subclasses_changing_the_likelihood(tmp_path, monkeypatc
     lf.prepare()
     lf.set_data(np.zeros(5, dtype=[('x', float), ('source', int)]))
     assert not lf.supports_gradient()
+
+
+def test_unbinned_cubic_hermite_keeps_data_independent_part_between_data_sets(tmp_path, monkeypatch):
+    """The sum of the pmf does not depend on the data: it is computed once, and a second data set
+    gives the same likelihood and gradient as a likelihood that was never given other data."""
+    monkeypatch.chdir(tmp_path)
+    # The sources' MC histograms are random, and shared between anchors through the pdf cache. Fill the
+    # cache first, so that both likelihoods below are built from the same models.
+    make_likelihood(source_wise=True, morpher='CubicHermiteInterpolator')
+    reused = make_likelihood(source_wise=True, morpher='CubicHermiteInterpolator', seed=0)
+    rows = reused._pmf_sum_caches['s0']['pmf_sum_rows'][1]
+    reused.set_data(make_data(1))
+    assert reused._pmf_sum_caches['s0']['pmf_sum_rows'][1] is rows  # not recomputed
+    fresh = make_likelihood(source_wise=True, morpher='CubicHermiteInterpolator', seed=1)
+    for name in reused.anchor_sources:
+        for a, b in zip(reused.anchor_sources[name].values(), fresh.anchor_sources[name].values()):
+            np.testing.assert_array_equal(a.get_pmf_grid()[0], b.get_pmf_grid()[0])  # same models
+    for kwargs in POINTS:
+        value, gradient = reused.loglikelihood_and_gradient(**kwargs)
+        fresh_value, fresh_gradient = fresh.loglikelihood_and_gradient(**kwargs)
+        assert value == fresh_value
+        assert gradient == fresh_gradient
+        assert reused(**kwargs) == fresh(**kwargs)
+
+
+def test_unbinned_cubic_hermite_cached_pmf_sum_equals_uncached(tmp_path, monkeypatch):
+    from blueice.likelihood import SourceShapeInterpolator
+    monkeypatch.chdir(tmp_path)
+    lf = make_likelihood(source_wise=True, morpher='CubicHermiteInterpolator')
+    events = lf.base_model.to_analysis_dimensions(make_data(2))
+    arguments = dict(morpher=lf.source_morphers['s0'], anchor_sources=lf.anchor_sources['s0'],
+                     source_index=0, shape_indices=lf.source_shape_indices['s0'], events=events)
+    uncached = SourceShapeInterpolator(**arguments)
+    cached = SourceShapeInterpolator(**arguments, pmf_sum_cache={})
+    np.testing.assert_array_equal(cached.interpolator.values, uncached.interpolator.values)
+    assert cached._slices == uncached._slices

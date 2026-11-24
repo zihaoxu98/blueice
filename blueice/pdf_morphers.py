@@ -95,6 +95,22 @@ class MultilinearGridInterpolator(object):
             [self.values[:, :columns.start], summed, self.values[:, columns.stop:]], axis=1))
         self.output_shape = (self.values.shape[1],)
 
+    def insert_outputs(self, position, rows):
+        """Insert outputs before the output at `position`, given by their stored anchor rows.
+
+        rows has one row per row of self.values (same grid and anchor order, e.g. from another
+        interpolator of the same class on the same grid) and any number of outputs; for example the
+        result of sum_outputs, so that it can be computed once and reused. The outputs from
+        `position` on move up by the number of inserted outputs.
+        """
+        rows = np.asarray(rows, dtype=float)
+        if rows.ndim != 2 or rows.shape[0] != self.values.shape[0]:
+            raise ValueError("rows must have shape (%d, n_outputs), got %s"
+                             % (self.values.shape[0], rows.shape))
+        self.values = np.ascontiguousarray(np.concatenate(
+            [self.values[:, :position], rows, self.values[:, position:]], axis=1))
+        self.output_shape = (self.values.shape[1],)
+
     def _locate(self, z):
         """Return the grid cell containing z: index of its lower anchor, the fractional position
         within the cell and the cell width, per dimension.
