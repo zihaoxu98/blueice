@@ -80,6 +80,22 @@ class MultilinearGridInterpolator(object):
                                  for i in range(2 ** self.n_dims)], dtype=int)
         self.corner_offsets = self.corners @ self.strides
 
+    def sum_outputs(self, columns):
+        """Replace the outputs in the slice `columns` by their sum, as a single output.
+
+        The interpolated outputs (and their derivatives) are weighted sums of the stored rows, with
+        weights that are the same for every output. The sum over some outputs, e.g. over the bins
+        of a pmf, is therefore the same weighted sum of the row sums, so it can be interpolated
+        without evaluating (or storing) the individual outputs: the cost and the memory of
+        the interpolator no longer depend on the number of summed outputs. The outputs after
+        the slice move up by len(columns) - 1 places.
+        """
+        columns = slice(*columns.indices(self.values.shape[1]))
+        summed = np.add.reduce(self.values[:, columns], axis=1, keepdims=True)
+        self.values = np.ascontiguousarray(np.concatenate(
+            [self.values[:, :columns.start], summed, self.values[:, columns.stop:]], axis=1))
+        self.output_shape = (self.values.shape[1],)
+
     def _locate(self, z):
         """Return the grid cell containing z: index of its lower anchor, the fractional position
         within the cell and the cell width, per dimension.

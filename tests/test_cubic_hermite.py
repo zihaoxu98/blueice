@@ -184,3 +184,28 @@ def test_source_wise_without_beeston_barlow():
     lf.add_shape_parameter('mu', (-1., 0., 1.))
     with pytest.raises(NotImplementedError):
         lf.prepare()
+
+
+@pytest.mark.parametrize("n_dims", [1, 2, 3])
+def test_sum_outputs_equals_sum_of_interpolated_outputs(n_dims):
+    """Interpolating the summed outputs is the same as summing the interpolated outputs, for the
+    value and for the gradient (PCHIP slopes are non-linear in the data, but the stored rows are
+    summed, not the data)."""
+    rng = np.random.default_rng(10 + n_dims)
+    grids = random_grids(rng, n_dims)
+    n_out = 40
+    scores = rng.uniform(0.01, 1, size=tuple(len(g) for g in grids) + (n_out,))
+    full = CubicHermiteGridInterpolator(grids, scores)
+    collapsed = CubicHermiteGridInterpolator(grids, scores)
+    collapsed.sum_outputs(slice(5, 35))
+    assert collapsed.values.shape[1] == n_out - 30 + 1
+    for _ in range(20):
+        z = random_point(rng, grids)
+        value, gradient = full.value_and_gradient(z)
+        c_value, c_gradient = collapsed.value_and_gradient(z)
+        np.testing.assert_allclose(c_value[:5], value[:5], rtol=1e-12, atol=1e-14)
+        np.testing.assert_allclose(c_value[5], value[5:35].sum(), rtol=1e-12)
+        np.testing.assert_allclose(c_value[6:], value[35:], rtol=1e-12, atol=1e-14)
+        np.testing.assert_allclose(c_gradient[:, 5], gradient[:, 5:35].sum(axis=1),
+                                   rtol=1e-10, atol=1e-12)
+        np.testing.assert_allclose(collapsed(z), c_value)

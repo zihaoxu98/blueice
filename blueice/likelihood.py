@@ -1039,14 +1039,27 @@ class SourceShapeInterpolator:
         sizes['rate'] = 1
         if self.renormalize:
             sizes['normalization'] = 1
-        self._slices, start = OrderedDict(), 0
-        for name, size in sizes.items():
-            self._slices[name] = slice(start, start + size)
-            start += size
+        self._slices, n_outputs = self._layout(sizes)
 
         self.interpolator = morpher.make_interpolator(
-            f=self._anchor_vector, extra_dims=[start], anchor_models=anchor_sources)
+            f=self._anchor_vector, extra_dims=[n_outputs], anchor_models=anchor_sources)
+        if events is not None and self.renormalize and hasattr(self.interpolator, 'sum_outputs'):
+            # Unbinned: only the sum of the interpolated pmf is needed (to renormalize the pdf at
+            # the events), not the pmf itself. Interpolate just that sum, which is exactly the sum
+            # of the interpolated pmf but costs O(1) instead of O(n_bins) per evaluation.
+            self.interpolator.sum_outputs(self._slices['pmf'])
+            sizes['pmf'] = 1
+            self._slices, _ = self._layout(sizes)
         self._last_evaluation = (None, None)  # (zs of this source, result of _evaluate)
+
+    @staticmethod
+    def _layout(sizes):
+        """Slices of the quantities in the interpolated vector, and its length."""
+        slices, start = OrderedDict(), 0
+        for name, size in sizes.items():
+            slices[name] = slice(start, start + size)
+            start += size
+        return slices, start
 
     def _anchor_vector(self, source):
         parts = []
